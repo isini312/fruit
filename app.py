@@ -2,18 +2,11 @@ import os
 import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import tensorflow as tf
-from keras._tf_keras.keras.models import load_model
+from tensorflow import keras
+from tensorflow.keras.models import load_model
 import gdown
-
-# Try importing OpenCV with fallback
-try:
-    import cv2
-    CV2_AVAILABLE = True
-    print("✅ OpenCV loaded successfully")
-except ImportError as e:
-    print(f"❌ OpenCV import failed: {e}")
-    CV2_AVAILABLE = False
+from PIL import Image
+import io
 
 app = Flask(__name__)
 CORS(app)
@@ -75,14 +68,19 @@ class FruitQualityPredictor:
             print(f"❌ Download failed: {e}")
     
     def preprocess_image(self, image):
-        """Preprocess the image for prediction"""
-        if not CV2_AVAILABLE:
-            raise ImportError("OpenCV is not available")
+        """Preprocess the image for prediction using PIL"""
+        # Convert PIL Image to numpy array
+        image = image.resize(self.IMG_SIZE)
+        image_array = np.array(image)
         
-        image = cv2.resize(image, self.IMG_SIZE)
-        image = image / 255.0
-        image = np.expand_dims(image, axis=0)
-        return image
+        # If image has alpha channel, remove it
+        if image_array.shape[-1] == 4:
+            image_array = image_array[:, :, :3]
+        
+        # Normalize
+        image_array = image_array / 255.0
+        image_array = np.expand_dims(image_array, axis=0)
+        return image_array
     
     def parse_prediction(self, predicted_class):
         """Parse the predicted class into fruit type and quality"""
@@ -107,21 +105,18 @@ class FruitQualityPredictor:
             return "Unknown", predicted_class
     
     def predict_image(self, image_file):
-        """Predict fruit quality from image"""
+        """Predict fruit quality from image using PIL"""
         if self.model is None:
             return {"error": "Model not loaded"}
         
-        if not CV2_AVAILABLE:
-            return {"error": "OpenCV not available - cannot process images"}
-        
         try:
-            # Read image file
+            # Read image file with PIL
             image_bytes = image_file.read()
-            nparr = np.frombuffer(image_bytes, np.uint8)
-            image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            image = Image.open(io.BytesIO(image_bytes))
             
-            if image is None:
-                return {"error": "Could not decode image"}
+            # Convert to RGB if necessary
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
             
             # Preprocess and predict
             processed_image = self.preprocess_image(image)
@@ -165,24 +160,19 @@ def home():
     return jsonify({
         "message": "Fruit Quality Prediction API",
         "status": "running",
-        "model_loaded": predictor.model is not None,
-        "opencv_available": CV2_AVAILABLE
+        "model_loaded": predictor.model is not None
     })
 
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
         "status": "healthy",
-        "model_loaded": predictor.model is not None,
-        "opencv_available": CV2_AVAILABLE
+        "model_loaded": predictor.model is not None
     })
 
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        if not CV2_AVAILABLE:
-            return jsonify({"error": "OpenCV not available - image processing disabled"}), 500
-        
         if 'image' not in request.files:
             return jsonify({"error": "No image file provided"}), 400
         
