@@ -1,11 +1,19 @@
 import os
 import numpy as np
-import cv2
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import tensorflow as tf
 from keras._tf_keras.keras.models import load_model
 import gdown
+
+# Try importing OpenCV with fallback
+try:
+    import cv2
+    CV2_AVAILABLE = True
+    print("✅ OpenCV loaded successfully")
+except ImportError as e:
+    print(f"❌ OpenCV import failed: {e}")
+    CV2_AVAILABLE = False
 
 app = Flask(__name__)
 CORS(app)
@@ -68,6 +76,9 @@ class FruitQualityPredictor:
     
     def preprocess_image(self, image):
         """Preprocess the image for prediction"""
+        if not CV2_AVAILABLE:
+            raise ImportError("OpenCV is not available")
+        
         image = cv2.resize(image, self.IMG_SIZE)
         image = image / 255.0
         image = np.expand_dims(image, axis=0)
@@ -99,6 +110,9 @@ class FruitQualityPredictor:
         """Predict fruit quality from image"""
         if self.model is None:
             return {"error": "Model not loaded"}
+        
+        if not CV2_AVAILABLE:
+            return {"error": "OpenCV not available - cannot process images"}
         
         try:
             # Read image file
@@ -151,19 +165,24 @@ def home():
     return jsonify({
         "message": "Fruit Quality Prediction API",
         "status": "running",
-        "model_loaded": predictor.model is not None
+        "model_loaded": predictor.model is not None,
+        "opencv_available": CV2_AVAILABLE
     })
 
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
         "status": "healthy",
-        "model_loaded": predictor.model is not None
+        "model_loaded": predictor.model is not None,
+        "opencv_available": CV2_AVAILABLE
     })
 
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
+        if not CV2_AVAILABLE:
+            return jsonify({"error": "OpenCV not available - image processing disabled"}), 500
+        
         if 'image' not in request.files:
             return jsonify({"error": "No image file provided"}), 400
         
@@ -189,7 +208,6 @@ def predict():
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
-# This is important for Railway
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
