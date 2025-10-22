@@ -2,11 +2,15 @@ import os
 import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from tensorflow import keras
 from tensorflow.keras.models import load_model
-import gdown
+import requests
 from PIL import Image
 import io
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
@@ -39,45 +43,74 @@ class FruitQualityPredictor:
         self.model = None
         self.load_model()
     
-    def load_model(self):
-        """Load the trained model with fallback options"""
-        model_path = 'fruitnet_final_model.keras'
-        
-        # If model doesn't exist locally, download it
-        if not os.path.exists(model_path):
-            print("📥 Model not found locally. Downloading...")
-            self.download_model()
-        
+    def download_from_github(self, url, filename):
+        """Download file from GitHub raw URL"""
         try:
-            self.model = load_model(model_path)
-            print("✅ Model loaded successfully!")
-        except Exception as e:
-            print(f"❌ Error loading model: {e}")
-    
-    def download_model(self):
-        """Download model from cloud storage"""
-        try:
-            # Replace with your actual Google Drive file ID
-            file_id = '1YOUR_FILE_ID_HERE'  # ⚠️ Replace this!
-            url = f'https://drive.google.com/uc?id={file_id}'
-            output = 'fruitnet_final_model.keras'
+            logger.info(f"📥 Downloading {filename} from GitHub...")
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
             
-            gdown.download(url, output, quiet=False)
-            print("✅ Model downloaded successfully!")
+            with open(filename, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            logger.info(f"✅ Successfully downloaded {filename}")
+            return True
+            
         except Exception as e:
-            print(f"❌ Download failed: {e}")
+            logger.error(f"❌ Failed to download {filename}: {e}")
+            return False
+    
+    def load_model(self):
+        """Load the trained model from GitHub"""
+        model_files = [
+            {
+                'url': 'https://raw.githubusercontent.com/isini312/fruit/main/best_model.keras',
+                'filename': 'best_model.keras'
+            },
+            {
+                'url': 'https://raw.githubusercontent.com/isini312/fruit/main/fruitnet_final_model.keras', 
+                'filename': 'fruitnet_final_model.keras'
+            }
+        ]
+        
+        logger.info("🔄 Attempting to load model...")
+        
+        # Try each model file
+        for model_info in model_files:
+            filename = model_info['filename']
+            url = model_info['url']
+            
+            # Download if file doesn't exist
+            if not os.path.exists(filename):
+                logger.info(f"📁 {filename} not found, downloading...")
+                if not self.download_from_github(url, filename):
+                    continue
+            
+            # Try to load the model
+            try:
+                logger.info(f"🔄 Loading model from: {filename}")
+                self.model = load_model(filename)
+                logger.info("✅ Model loaded successfully!")
+                return
+                
+            except Exception as e:
+                logger.error(f"❌ Error loading {filename}: {e}")
+                # Remove corrupted file and try next one
+                if os.path.exists(filename):
+                    os.remove(filename)
+                continue
+        
+        logger.error("❌ All model loading attempts failed")
     
     def preprocess_image(self, image):
-        """Preprocess the image for prediction using PIL"""
-        # Convert PIL Image to numpy array
+        """Preprocess the image for prediction"""
         image = image.resize(self.IMG_SIZE)
         image_array = np.array(image)
         
-        # If image has alpha channel, remove it
         if image_array.shape[-1] == 4:
             image_array = image_array[:, :, :3]
         
-        # Normalize
         image_array = image_array / 255.0
         image_array = np.expand_dims(image_array, axis=0)
         return image_array
@@ -102,15 +135,16 @@ class FruitQualityPredictor:
                 fruit = predicted_class
             return quality, fruit
         except Exception as e:
+            logger.error(f"Error parsing prediction: {e}")
             return "Unknown", predicted_class
     
     def predict_image(self, image_file):
-        """Predict fruit quality from image using PIL"""
+        """Predict fruit quality from image"""
         if self.model is None:
-            return {"error": "Model not loaded"}
+            return {"error": "Model not loaded. Please check server logs."}
         
         try:
-            # Read image file with PIL
+            # Read image file
             image_bytes = image_file.read()
             image = Image.open(io.BytesIO(image_bytes))
             
@@ -150,6 +184,7 @@ class FruitQualityPredictor:
             }
             
         except Exception as e:
+            logger.error(f"Prediction failed: {e}")
             return {"error": f"Prediction failed: {str(e)}"}
 
 # Initialize predictor
@@ -196,6 +231,7 @@ def predict():
         return jsonify(result)
         
     except Exception as e:
+        logger.error(f"Server error in /predict: {e}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 if __name__ == '__main__':
