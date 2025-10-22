@@ -5,9 +5,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import tensorflow as tf
 from keras._tf_keras.keras.models import load_model
-from PIL import Image
-import io
-import base64
+import gdown
 
 app = Flask(__name__)
 CORS(app)
@@ -41,16 +39,32 @@ class FruitQualityPredictor:
         self.load_model()
     
     def load_model(self):
-        """Load the trained model"""
+        """Load the trained model with fallback options"""
+        model_path = 'fruitnet_final_model.keras'
+        
+        # If model doesn't exist locally, download it
+        if not os.path.exists(model_path):
+            print("📥 Model not found locally. Downloading...")
+            self.download_model()
+        
         try:
-            model_path = 'fruitnet_final_model.keras'
-            if not os.path.exists(model_path):
-                model_path = 'best_model.keras'
-            
             self.model = load_model(model_path)
             print("✅ Model loaded successfully!")
         except Exception as e:
             print(f"❌ Error loading model: {e}")
+    
+    def download_model(self):
+        """Download model from cloud storage"""
+        try:
+            # Replace with your actual Google Drive file ID
+            file_id = '1YOUR_FILE_ID_HERE'  # ⚠️ Replace this!
+            url = f'https://drive.google.com/uc?id={file_id}'
+            output = 'fruitnet_final_model.keras'
+            
+            gdown.download(url, output, quiet=False)
+            print("✅ Model downloaded successfully!")
+        except Exception as e:
+            print(f"❌ Download failed: {e}")
     
     def preprocess_image(self, image):
         """Preprocess the image for prediction"""
@@ -123,8 +137,7 @@ class FruitQualityPredictor:
                 'fruit': fruit,
                 'quality': quality,
                 'confidence': float(confidence),
-                'top_predictions': top_3_predictions,
-                'timestamp': np.datetime64('now').astype(str)
+                'top_predictions': top_3_predictions
             }
             
         except Exception as e:
@@ -138,10 +151,7 @@ def home():
     return jsonify({
         "message": "Fruit Quality Prediction API",
         "status": "running",
-        "endpoints": {
-            "health": "/health",
-            "predict": "/predict (POST)"
-        }
+        "model_loaded": predictor.model is not None
     })
 
 @app.route('/health', methods=['GET'])
@@ -179,6 +189,7 @@ def predict():
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
+# This is important for Railway
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
