@@ -46,12 +46,12 @@ class FruitQualityPredictor:
     def load_model(self):
         """Load model from local files with multiple fallbacks"""
         model_paths = [
-            'models/fruitnet_final_model.keras',
-            'models/best_model.keras',
+            '/fruitnet_final_model.keras',
+            '/best_model.keras',
             'fruitnet_final_model.keras',
             'best_model.keras',
-            '/app/models/fruitnet_final_model.keras',  # Railway path
-            '/app/models/best_model.keras',            # Railway path
+            '/app/fruitnet_final_model.keras',  # Railway path
+            '/app/best_model.keras',            # Railway path
         ]
         
         logger.info("🔄 Attempting to load model...")
