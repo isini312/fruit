@@ -8,6 +8,7 @@ import time
 import io
 import base64
 from werkzeug.utils import secure_filename
+import threading
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -27,7 +28,7 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 # Create upload folder
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Model URLs - Using direct GitHub raw URLs
+# Model URLs
 MODEL_FILES = [
     {
         'url': 'https://github.com/isini312/fruit/raw/main/best_model.keras',
@@ -39,19 +40,7 @@ MODEL_FILES = [
     }
 ]
 
-# Alternative URLs if the above fail
-ALTERNATIVE_MODEL_URLS = [
-    {
-        'url': 'https://raw.githubusercontent.com/isini312/fruit/main/best_model.keras',
-        'filename': 'best_model.keras'
-    },
-    {
-        'url': 'https://raw.githubusercontent.com/isini312/fruit/main/fruitnet_final_model.keras',
-        'filename': 'fruitnet_final_model.keras'
-    }
-]
-
-# Try to import dependencies with fallbacks
+# Try to import dependencies
 try:
     import tensorflow as tf
     from tensorflow.keras.models import load_model
@@ -77,181 +66,53 @@ except ImportError as e:
     PILLOW_AVAILABLE = False
     logger.error(f"❌ PIL import failed: {e}")
 
-def download_model_with_retry(url, filename, max_retries=3):
-    """Download model file from URL with retry logic"""
-    for attempt in range(max_retries):
-        try:
-            logger.info(f"📥 Downloading {filename} from {url} (attempt {attempt + 1}/{max_retries})")
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            
-            # Check if we got actual content
-            content_length = response.headers.get('content-length')
-            if content_length and int(content_length) < 1000:  # Too small for a model
-                logger.warning(f"⚠️ File seems too small: {content_length} bytes")
-                continue
-            
-            total_size = int(content_length) if content_length else 0
-            downloaded_size = 0
-            
-            with open(filename, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded_size += len(chunk)
-                        if total_size > 0 and downloaded_size % (1024 * 1024) == 0:
-                            progress = (downloaded_size / total_size) * 100
-                            logger.info(f"📦 Downloading {filename}: {progress:.1f}%")
-            
-            # Verify file was actually downloaded
-            if not os.path.exists(filename):
-                logger.error(f"❌ File {filename} was not created")
-                continue
-                
-            file_size = os.path.getsize(filename)
-            logger.info(f"✅ Downloaded {filename} ({file_size / (1024*1024):.2f} MB)")
-            
-            # Check if file has reasonable size (models should be > 1MB)
-            if file_size < 1024 * 1024:  # Less than 1MB
-                logger.warning(f"⚠️ File {filename} is suspiciously small: {file_size} bytes")
-                os.remove(filename)  # Remove corrupted file
-                continue
-                
-            return True
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"❌ Download attempt {attempt + 1} failed: {e}")
-            time.sleep(2)  # Wait before retry
-        except Exception as e:
-            logger.error(f"❌ Unexpected error during download: {e}")
-            time.sleep(2)
-    
-    return False
+# Global variables
+predictor = None
+initialization_in_progress = True
+initialization_error = None
 
-def download_all_models():
-    """Download all required model files with fallback URLs"""
-    logger.info("🔄 Checking for model files...")
-    
-    models_downloaded = 0
-    for model_info in MODEL_FILES:
-        filename = model_info['filename']
-        primary_url = model_info['url']
-        
-        # Check if file already exists and is valid
-        if os.path.exists(filename):
-            file_size = os.path.getsize(filename)
-            logger.info(f"📁 {filename} exists ({file_size / (1024*1024):.2f} MB)")
-            
-            # Check if file is valid (not empty/corrupted)
-            if file_size > 1024 * 1024:  # More than 1MB
-                logger.info(f"✅ {filename} appears valid")
-                models_downloaded += 1
-                continue
-            else:
-                logger.warning(f"⚠️ {filename} is too small, re-downloading...")
-                os.remove(filename)
-        
-        # Try primary URL first
-        logger.info(f"🔄 Downloading {filename} from primary URL...")
-        if download_model_with_retry(primary_url, filename):
-            models_downloaded += 1
-        else:
-            # Try alternative URL
-            logger.warning(f"⚠️ Primary URL failed, trying alternative URL for {filename}...")
-            alt_url = None
-            for alt_model in ALTERNATIVE_MODEL_URLS:
-                if alt_model['filename'] == filename:
-                    alt_url = alt_model['url']
-                    break
-            
-            if alt_url and download_model_with_retry(alt_url, filename):
-                models_downloaded += 1
-            else:
-                logger.error(f"❌ All download attempts failed for {filename}")
-    
-    return models_downloaded == len(MODEL_FILES)
-
-def preprocess_image_pil(image_data):
-    """Preprocess image using PIL (fallback when OpenCV is not available)"""
+def download_model(url, filename):
+    """Download model file from URL"""
     try:
-        # Convert to RGB if needed
-        if image_data.mode != 'RGB':
-            image_data = image_data.convert('RGB')
+        logger.info(f"📥 Starting download: {filename}")
+        response = requests.get(url, stream=True, timeout=60)
+        response.raise_for_status()
         
-        # Resize image
-        img_resized = image_data.resize((224, 224))
+        total_size = int(response.headers.get('content-length', 0))
+        downloaded_size = 0
         
-        # Convert to numpy array and normalize
-        img_array = np.array(img_resized) / 255.0
+        with open(filename, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded_size += len(chunk)
+                    if total_size > 0:
+                        progress = (downloaded_size / total_size) * 100
+                        if downloaded_size % (5 * 1024 * 1024) == 0:  # Log every 5MB
+                            logger.info(f"📦 {filename}: {progress:.1f}% ({downloaded_size/(1024*1024):.1f} MB)")
         
-        # Add batch dimension
-        img_array = np.expand_dims(img_array, axis=0)
+        file_size = os.path.getsize(filename)
+        logger.info(f"✅ Download complete: {filename} ({file_size/(1024*1024):.2f} MB)")
+        return True
         
-        return img_array
     except Exception as e:
-        logger.error(f"PIL preprocessing error: {e}")
-        raise
+        logger.error(f"❌ Download failed: {filename} - {e}")
+        return False
 
-def preprocess_image_cv2(image_path):
-    """Preprocess image using OpenCV"""
-    try:
-        # Read image
-        image = cv2.imread(image_path)
-        if image is None:
-            raise ValueError("Could not load image")
-        
-        # Convert BGR to RGB
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # Resize image
-        image = cv2.resize(image, (224, 224))
-        
-        # Normalize pixel values
-        image = image / 255.0
-        
-        # Add batch dimension
-        image = np.expand_dims(image, axis=0)
-        
-        return image
-    except Exception as e:
-        logger.error(f"OpenCV preprocessing error: {e}")
-        raise
-
-class FruitQualityPredictor:
+class SimpleFruitPredictor:
     def __init__(self):
-        if not TENSORFLOW_AVAILABLE:
-            raise ImportError("TensorFlow is not available")
-            
         self.IMG_SIZE = (224, 224)
         
-        # Class names based on dataset structure
+        # Class names
         self.fruit_classes = [
-            # Bad Quality Fruits
-            'Bad Quality_Fruits_Apple_Bad',
-            'Bad Quality_Fruits_Banana_Bad', 
-            'Bad Quality_Fruits_Guava_Bad',
-            'Bad Quality_Fruits_Lime_Bad',
-            'Bad Quality_Fruits_Orange_Bad',
-            'Bad Quality_Fruits_Pomegranate_Bad',
-            
-            # Good Quality Fruits
-            'Good Quality_Fruits_Apple_Good',
-            'Good Quality_Fruits_Banana_Good',
-            'Good Quality_Fruits_Guava_Good',
-            'Good Quality_Fruits_Lime_Good',
-            'Good Quality_Fruits_Orange_Good',
-            'Good Quality_Fruits_Pomegranate_Good',
-            
-            # Mixed Quality Fruits
-            'Mixed Qualit_Fruits_Apple',
-            'Mixed Qualit_Fruits_Banana',
-            'Mixed Qualit_Fruits_Guava',
-            'Mixed Qualit_Fruits_Lemon',
-            'Mixed Qualit_Fruits_Orange',
-            'Mixed Qualit_Fruits_Pomegranate'
+            'Bad Quality_Fruits_Apple_Bad', 'Bad Quality_Fruits_Banana_Bad', 'Bad Quality_Fruits_Guava_Bad',
+            'Bad Quality_Fruits_Lime_Bad', 'Bad Quality_Fruits_Orange_Bad', 'Bad Quality_Fruits_Pomegranate_Bad',
+            'Good Quality_Fruits_Apple_Good', 'Good Quality_Fruits_Banana_Good', 'Good Quality_Fruits_Guava_Good',
+            'Good Quality_Fruits_Lime_Good', 'Good Quality_Fruits_Orange_Good', 'Good Quality_Fruits_Pomegranate_Good',
+            'Mixed Qualit_Fruits_Apple', 'Mixed Qualit_Fruits_Banana', 'Mixed Qualit_Fruits_Guava',
+            'Mixed Qualit_Fruits_Lemon', 'Mixed Qualit_Fruits_Orange', 'Mixed Qualit_Fruits_Pomegranate'
         ]
         
-        # Fruit name mapping
         self.fruit_name_mapping = {
             'Apple_Bad': 'Apple', 'Apple_Good': 'Apple', 'Apple': 'Apple',
             'Banana_Bad': 'Banana', 'Banana_Good': 'Banana', 'Banana': 'Banana',
@@ -261,317 +122,193 @@ class FruitQualityPredictor:
             'Pomegranate_Bad': 'Pomegranate', 'Pomegranate_Good': 'Pomegranate', 'Pomegranate': 'Pomegranate'
         }
         
-        self.models = {}
-        self.load_models()
+        self.model = None
+        self.load_model()
     
-    def load_models(self):
-        """Load all available models with validation"""
-        try:
-            model_files = {}
-            
-            # Check for model files
-            for model_info in MODEL_FILES:
-                filename = model_info['filename']
-                if os.path.exists(filename):
-                    file_size = os.path.getsize(filename)
-                    if file_size > 1024 * 1024:  # Only consider files > 1MB as valid
-                        model_name = filename.replace('.keras', '')
-                        model_files[model_name] = filename
-                        logger.info(f"✅ Found valid model: {filename} ({file_size / (1024*1024):.2f} MB)")
-                    else:
-                        logger.warning(f"⚠️ Model file too small, likely corrupted: {filename} ({file_size} bytes)")
-                else:
-                    logger.warning(f"⚠️ Model file not found: {filename}")
-            
-            if not model_files:
-                raise Exception("No valid model files found. Please download models first.")
-            
-            logger.info("🔄 Loading models...")
-            for model_name, model_path in model_files.items():
-                logger.info(f"   Loading {model_name} from {model_path}")
+    def load_model(self):
+        """Load the first available model"""
+        for model_info in MODEL_FILES:
+            filename = model_info['filename']
+            if os.path.exists(filename) and os.path.getsize(filename) > 1024 * 1024:
                 try:
-                    # Test load the model
-                    self.models[model_name] = load_model(model_path)
-                    logger.info(f"   ✅ {model_name} loaded successfully")
-                    
-                    # Test prediction with dummy data to verify model works
-                    test_input = np.random.random((1, 224, 224, 3)).astype(np.float32)
-                    test_prediction = self.models[model_name].predict(test_input, verbose=0)
-                    logger.info(f"   ✅ {model_name} test prediction successful (shape: {test_prediction.shape})")
-                    
+                    logger.info(f"🔄 Loading model: {filename}")
+                    self.model = load_model(filename)
+                    logger.info(f"✅ Model loaded: {filename}")
+                    return
                 except Exception as e:
-                    logger.error(f"   ❌ Failed to load {model_name}: {e}")
-                    # Remove corrupted file
-                    if os.path.exists(model_path):
-                        os.remove(model_path)
-                        logger.info(f"   🗑️ Removed corrupted file: {model_path}")
-                    raise
-            
-            logger.info(f"🎯 All models loaded successfully! {len(self.models)} models ready.")
-            
-        except Exception as e:
-            logger.error(f"❌ Error loading models: {e}")
-            raise
-
+                    logger.error(f"❌ Failed to load {filename}: {e}")
+        
+        raise Exception("No valid model found")
+    
+    def preprocess_image(self, image_path):
+        """Preprocess image"""
+        if OPENCV_AVAILABLE:
+            image = cv2.imread(image_path)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        else:
+            image = np.array(Image.open(image_path).convert('RGB'))
+        
+        image = cv2.resize(image, self.IMG_SIZE) if OPENCV_AVAILABLE else np.array(Image.fromarray(image).resize(self.IMG_SIZE))
+        image = image / 255.0
+        return np.expand_dims(image, axis=0)
+    
     def parse_prediction(self, predicted_class):
-        """Parse prediction into fruit and quality"""
-        try:
-            if 'Bad Quality_Fruits' in predicted_class:
-                quality = "Bad Quality"
-                fruit_part = predicted_class.replace('Bad Quality_Fruits_', '')
-                fruit = self.fruit_name_mapping.get(fruit_part, fruit_part.replace('_Bad', ''))
-            elif 'Good Quality_Fruits' in predicted_class:
-                quality = "Good Quality"
-                fruit_part = predicted_class.replace('Good Quality_Fruits_', '')
-                fruit = self.fruit_name_mapping.get(fruit_part, fruit_part.replace('_Good', ''))
-            elif 'Mixed Qualit_Fruits' in predicted_class:
-                quality = "Mixed Quality"
-                fruit_part = predicted_class.replace('Mixed Qualit_Fruits_', '')
-                fruit = self.fruit_name_mapping.get(fruit_part, fruit_part)
-            else:
-                quality = "Unknown"
-                fruit = predicted_class
-            
-            return quality, fruit
-        except Exception as e:
-            logger.error(f"Error parsing prediction: {e}")
-            return "Unknown", predicted_class
+        """Parse prediction result"""
+        if 'Bad Quality_Fruits' in predicted_class:
+            quality = "Bad Quality"
+            fruit = predicted_class.replace('Bad Quality_Fruits_', '').replace('_Bad', '')
+        elif 'Good Quality_Fruits' in predicted_class:
+            quality = "Good Quality"
+            fruit = predicted_class.replace('Good Quality_Fruits_', '').replace('_Good', '')
+        elif 'Mixed Qualit_Fruits' in predicted_class:
+            quality = "Mixed Quality"
+            fruit = predicted_class.replace('Mixed Qualit_Fruits_', '')
+        else:
+            quality = "Unknown"
+            fruit = predicted_class
+        
+        fruit = self.fruit_name_mapping.get(fruit, fruit)
+        return quality, fruit
     
-    def predict_quality(self, image_path):
-        """Predict fruit quality from image"""
+    def predict(self, image_path):
+        """Make prediction"""
         try:
-            # Preprocess image based on available libraries
-            if OPENCV_AVAILABLE:
-                processed_image = preprocess_image_cv2(image_path)
-            elif PILLOW_AVAILABLE:
-                image = Image.open(image_path)
-                processed_image = preprocess_image_pil(image)
-            else:
-                return {"error": "No image processing library available"}
-            
-            # Get predictions from all models
-            all_predictions = []
-            model_results = {}
-            
-            for model_name, model in self.models.items():
-                try:
-                    predictions = model.predict(processed_image, verbose=0)[0]
-                    predicted_class_idx = np.argmax(predictions)
-                    confidence = np.max(predictions)
-                    predicted_class = self.fruit_classes[predicted_class_idx]
-                    quality, fruit = self.parse_prediction(predicted_class)
-                    
-                    model_results[model_name] = {
-                        'fruit': fruit,
-                        'quality': quality,
-                        'confidence': float(confidence),
-                        'full_class': predicted_class
-                    }
-                    all_predictions.append(predictions)
-                    logger.info(f"✅ {model_name} prediction: {fruit} - {quality} ({confidence:.2%})")
-                except Exception as e:
-                    logger.error(f"❌ {model_name} prediction failed: {e}")
-                    continue
-            
-            if not all_predictions:
-                return {"error": "All model predictions failed"}
-            
-            # Ensemble prediction
-            ensemble_predictions = np.mean(all_predictions, axis=0)
-            ensemble_class_idx = np.argmax(ensemble_predictions)
-            ensemble_confidence = np.max(ensemble_predictions)
-            ensemble_class = self.fruit_classes[ensemble_class_idx]
-            ensemble_quality, ensemble_fruit = self.parse_prediction(ensemble_class)
+            processed_image = self.preprocess_image(image_path)
+            predictions = self.model.predict(processed_image, verbose=0)[0]
+            predicted_class_idx = np.argmax(predictions)
+            confidence = np.max(predictions)
+            predicted_class = self.fruit_classes[predicted_class_idx]
+            quality, fruit = self.parse_prediction(predicted_class)
             
             # Get top 3 predictions
-            top_3_indices = np.argsort(ensemble_predictions)[-3:][::-1]
-            top_3_predictions = []
-            
+            top_3_indices = np.argsort(predictions)[-3:][::-1]
+            top_predictions = []
             for idx in top_3_indices:
                 pred_class = self.fruit_classes[idx]
                 pred_quality, pred_fruit = self.parse_prediction(pred_class)
-                top_3_predictions.append({
+                top_predictions.append({
                     'fruit': pred_fruit,
                     'quality': pred_quality,
-                    'confidence': float(ensemble_predictions[idx])
+                    'confidence': float(predictions[idx])
                 })
-            
-            # Check model agreement
-            individual_predictions = [result['fruit'] for result in model_results.values()]
-            agreement_count = len([p for p in individual_predictions if p == ensemble_fruit])
             
             return {
                 'success': True,
                 'prediction': {
-                    'fruit': ensemble_fruit,
-                    'quality': ensemble_quality,
-                    'confidence': float(ensemble_confidence),
-                    'full_class': ensemble_class
+                    'fruit': fruit,
+                    'quality': quality,
+                    'confidence': float(confidence),
+                    'full_class': predicted_class
                 },
-                'top_predictions': top_3_predictions,
-                'model_info': {
-                    'models_used': list(self.models.keys()),
-                    'models_agree': agreement_count == len(self.models),
-                    'agreement_count': agreement_count,
-                    'total_models': len(self.models),
-                    'image_processor': 'opencv' if OPENCV_AVAILABLE else 'pil'
-                },
-                'individual_results': model_results
+                'top_predictions': top_predictions
             }
             
         except Exception as e:
             logger.error(f"Prediction error: {e}")
-            return {"error": f"Prediction failed: {str(e)}"}
+            return {'error': str(e)}
 
-# Global predictor instance
-predictor = None
-
-def initialize_predictor():
-    """Initialize the predictor with model downloading"""
-    global predictor
-    
-    if not TENSORFLOW_AVAILABLE:
-        logger.error("❌ TensorFlow not available")
-        return False
+def initialize_app():
+    """Initialize the application in background"""
+    global predictor, initialization_in_progress, initialization_error
     
     try:
-        logger.info("🚀 Initializing Fruit Quality Predictor...")
+        logger.info("🚀 Starting application initialization...")
         
-        # Download models first
-        logger.info("📥 Downloading model files...")
-        if not download_all_models():
-            logger.error("❌ Failed to download all models")
-            return False
+        # Download models
+        for model_info in MODEL_FILES:
+            filename = model_info['filename']
+            url = model_info['url']
+            
+            if not os.path.exists(filename) or os.path.getsize(filename) < 1024 * 1024:
+                logger.info(f"📥 Downloading {filename}...")
+                if not download_model(url, filename):
+                    logger.error(f"❌ Failed to download {filename}")
         
         # Initialize predictor
-        logger.info("🔄 Loading models into memory...")
-        predictor = FruitQualityPredictor()
-        logger.info("✅ Fruit Quality Predictor initialized successfully!")
-        return True
-        
+        if TENSORFLOW_AVAILABLE:
+            predictor = SimpleFruitPredictor()
+            logger.info("✅ Application initialized successfully!")
+        else:
+            raise Exception("TensorFlow not available")
+            
     except Exception as e:
-        logger.error(f"❌ Failed to initialize predictor: {e}")
-        return False
+        logger.error(f"❌ Initialization failed: {e}")
+        initialization_error = str(e)
+    finally:
+        initialization_in_progress = False
 
-# Initialize on startup
-logger.info("🔧 Starting application initialization...")
-initialize_predictor()
+# Start initialization in background thread
+init_thread = threading.Thread(target=initialize_app, daemon=True)
+init_thread.start()
 
 def allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 @app.route('/')
 def home():
+    status = 'initializing' if initialization_in_progress else 'ready' if predictor else 'error'
     return jsonify({
         'message': 'Fruit Quality Prediction API',
-        'status': 'running' if predictor else 'error',
-        'tensorflow_available': TENSORFLOW_AVAILABLE,
-        'opencv_available': OPENCV_AVAILABLE,
-        'pillow_available': PILLOW_AVAILABLE,
-        'predictor_initialized': predictor is not None,
-        'models_loaded': len(predictor.models) if predictor else 0,
-        'version': '1.0.0',
+        'status': status,
+        'initialization_in_progress': initialization_in_progress,
+        'initialization_error': initialization_error,
         'endpoints': {
             '/': 'GET - API information',
             '/health': 'GET - Health check',
-            '/predict': 'POST - Upload image file',
-            '/predict_base64': 'POST - Send base64 image',
-            '/reload': 'POST - Reload models',
-            '/debug': 'GET - Debug information'
+            '/predict': 'POST - Upload image for prediction'
         }
     })
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({
-        'status': 'healthy' if predictor else 'error',
-        'tensorflow_available': TENSORFLOW_AVAILABLE,
-        'opencv_available': OPENCV_AVAILABLE,
-        'pillow_available': PILLOW_AVAILABLE,
-        'predictor_initialized': predictor is not None,
-        'models_loaded': len(predictor.models) if predictor else 0,
-        'models': list(predictor.models.keys()) if predictor else [],
-        'timestamp': time.time()
-    })
-
-@app.route('/debug', methods=['GET'])
-def debug_info():
-    """Debug endpoint to check file status"""
-    file_info = {}
-    for model_info in MODEL_FILES:
-        filename = model_info['filename']
-        exists = os.path.exists(filename)
-        file_info[filename] = {
-            'exists': exists,
-            'size_bytes': os.path.getsize(filename) if exists else 0,
-            'size_mb': round(os.path.getsize(filename) / (1024*1024), 2) if exists else 0
-        }
-    
-    return jsonify({
-        'files': file_info,
-        'current_directory': os.listdir('.'),
-        'working_directory': os.getcwd()
-    })
-
-@app.route('/reload', methods=['POST'])
-def reload_models():
-    """Reload models (useful for updating models without restarting)"""
-    global predictor
-    try:
-        logger.info("🔄 Reloading models...")
-        predictor = None
-        
-        # Re-download and re-initialize
-        success = initialize_predictor()
-        
-        if success:
-            return jsonify({
-                'success': True,
-                'message': 'Models reloaded successfully',
-                'models_loaded': len(predictor.models)
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'error': 'Failed to reload models'
-            }), 500
-            
-    except Exception as e:
-        logger.error(f"Reload error: {e}")
+    if initialization_in_progress:
         return jsonify({
-            'success': False,
-            'error': str(e)
+            'status': 'initializing',
+            'message': 'Application is starting up, please wait...',
+            'timestamp': time.time()
+        })
+    elif predictor:
+        return jsonify({
+            'status': 'healthy',
+            'message': 'Application is ready',
+            'timestamp': time.time()
+        })
+    else:
+        return jsonify({
+            'status': 'error',
+            'error': initialization_error,
+            'timestamp': time.time()
         }), 500
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    if predictor is None:
+    if initialization_in_progress:
         return jsonify({
-            'error': 'Predictor not initialized',
-            'tensorflow_available': TENSORFLOW_AVAILABLE
+            'error': 'Application is still starting up. Please try again in a few moments.',
+            'status': 'initializing'
+        }), 503
+    
+    if not predictor:
+        return jsonify({
+            'error': f'Application failed to initialize: {initialization_error}',
+            'status': 'error'
         }), 500
     
-    # Check if image file is present
     if 'image' not in request.files:
         return jsonify({'error': 'No image file provided'}), 400
     
     file = request.files['image']
-    
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
     
     if file and allowed_file(file.filename):
         try:
-            # Secure filename and save
             filename = secure_filename(file.filename)
             filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             file.save(filepath)
             
-            # Make prediction
-            result = predictor.predict_quality(filepath)
+            result = predictor.predict(filepath)
             
-            # Clean up uploaded file
             if os.path.exists(filepath):
                 os.remove(filepath)
             
@@ -584,39 +321,39 @@ def predict():
             logger.error(f"Prediction error: {e}")
             return jsonify({'error': f'Server error: {str(e)}'}), 500
     
-    return jsonify({'error': 'Invalid file type. Allowed types: png, jpg, jpeg, bmp'}), 400
+    return jsonify({'error': 'Invalid file type'}), 400
 
 @app.route('/predict_base64', methods=['POST'])
 def predict_base64():
-    """Alternative endpoint for base64 encoded images"""
-    if predictor is None:
+    if initialization_in_progress:
         return jsonify({
-            'error': 'Predictor not initialized',
-            'tensorflow_available': TENSORFLOW_AVAILABLE
+            'error': 'Application is still starting up. Please try again in a few moments.',
+            'status': 'initializing'
+        }), 503
+    
+    if not predictor:
+        return jsonify({
+            'error': f'Application failed to initialize: {initialization_error}',
+            'status': 'error'
         }), 500
     
     try:
         data = request.get_json()
-        
         if not data or 'image' not in data:
             return jsonify({'error': 'No image data provided'}), 400
         
-        # Decode base64 image
         image_data = data['image']
         if 'base64,' in image_data:
             image_data = image_data.split('base64,')[1]
         
         image_bytes = base64.b64decode(image_data)
-        
-        # Save temporarily
         temp_path = os.path.join(app.config['UPLOAD_FOLDER'], 'temp_image.jpg')
+        
         with open(temp_path, 'wb') as f:
             f.write(image_bytes)
         
-        # Make prediction
-        result = predictor.predict_quality(temp_path)
+        result = predictor.predict(temp_path)
         
-        # Clean up
         if os.path.exists(temp_path):
             os.remove(temp_path)
         
@@ -633,28 +370,11 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     
     print("=" * 60)
-    print("🚀 Starting Fruit Quality Prediction API")
+    print("🚀 Fruit Quality Prediction API Starting...")
     print("=" * 60)
-    print(f"✅ TensorFlow Available: {TENSORFLOW_AVAILABLE}")
-    print(f"✅ OpenCV Available: {OPENCV_AVAILABLE}")
-    print(f"✅ PIL Available: {PILLOW_AVAILABLE}")
-    print(f"✅ Predictor Initialized: {predictor is not None}")
-    
-    if predictor:
-        print(f"✅ Models Loaded: {len(predictor.models)}")
-        for model_name in predictor.models.keys():
-            print(f"   - {model_name}")
-    else:
-        print("❌ Predictor not initialized - check logs for errors")
-    
-    print("\n📝 API Endpoints:")
-    print("   GET  /               - API information")
-    print("   GET  /health         - Health check")
-    print("   GET  /debug          - Debug information")
-    print("   POST /predict        - Upload image file")
-    print("   POST /predict_base64 - Send base64 image")
-    print("   POST /reload         - Reload models")
-    print(f"\n🌐 Server running on port: {port}")
+    print("📝 The application will be ready once models are downloaded.")
+    print("🌐 Check /health endpoint for status")
+    print(f"🔧 Port: {port}")
     print("=" * 60)
     
     app.run(debug=False, host='0.0.0.0', port=port)
