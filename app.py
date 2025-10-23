@@ -2,15 +2,12 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 import numpy as np
-import cv2
-from werkzeug.utils import secure_filename
-from PIL import Image
-import io
-import base64
 import logging
 import requests
 import time
-import sys
+import io
+import base64
+from werkzeug.utils import secure_filename
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -42,17 +39,31 @@ MODEL_FILES = [
     }
 ]
 
-# Try to import TensorFlow with fallback
+# Try to import dependencies with fallbacks
 try:
     import tensorflow as tf
     from tensorflow.keras.models import load_model
     TENSORFLOW_AVAILABLE = True
     logger.info("✅ TensorFlow imported successfully")
-    logger.info(f"✅ TensorFlow version: {tf.__version__}")
-    logger.info(f"✅ NumPy version: {np.__version__}")
 except ImportError as e:
     TENSORFLOW_AVAILABLE = False
     logger.error(f"❌ TensorFlow import failed: {e}")
+
+try:
+    import cv2
+    OPENCV_AVAILABLE = True
+    logger.info("✅ OpenCV imported successfully")
+except ImportError as e:
+    OPENCV_AVAILABLE = False
+    logger.error(f"❌ OpenCV import failed: {e}")
+
+try:
+    from PIL import Image
+    PILLOW_AVAILABLE = True
+    logger.info("✅ PIL imported successfully")
+except ImportError as e:
+    PILLOW_AVAILABLE = False
+    logger.error(f"❌ PIL import failed: {e}")
 
 def download_model(url, filename):
     """Download model file from URL"""
@@ -69,10 +80,9 @@ def download_model(url, filename):
                 if chunk:
                     f.write(chunk)
                     downloaded_size += len(chunk)
-                    if total_size > 0:
+                    if total_size > 0 and downloaded_size % (1024 * 1024) == 0:
                         progress = (downloaded_size / total_size) * 100
-                        if downloaded_size % (1024 * 1024) == 0:  # Log every MB
-                            logger.info(f"📦 Downloading {filename}: {progress:.1f}%")
+                        logger.info(f"📦 Downloading {filename}: {progress:.1f}%")
         
         file_size = os.path.getsize(filename)
         logger.info(f"✅ Downloaded {filename} ({file_size / (1024*1024):.2f} MB)")
@@ -104,12 +114,58 @@ def download_all_models():
     
     return models_downloaded == len(MODEL_FILES)
 
+def preprocess_image_pil(image_data):
+    """Preprocess image using PIL (fallback when OpenCV is not available)"""
+    try:
+        # Convert to RGB if needed
+        if image_data.mode != 'RGB':
+            image_data = image_data.convert('RGB')
+        
+        # Resize image
+        img_resized = image_data.resize((224, 224))
+        
+        # Convert to numpy array and normalize
+        img_array = np.array(img_resized) / 255.0
+        
+        # Add batch dimension
+        img_array = np.expand_dims(img_array, axis=0)
+        
+        return img_array
+    except Exception as e:
+        logger.error(f"PIL preprocessing error: {e}")
+        raise
+
+def preprocess_image_cv2(image_path):
+    """Preprocess image using OpenCV"""
+    try:
+        # Read image
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError("Could not load image")
+        
+        # Convert BGR to RGB
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Resize image
+        image = cv2.resize(image, (224, 224))
+        
+        # Normalize pixel values
+        image = image / 255.0
+        
+        # Add batch dimension
+        image = np.expand_dims(image, axis=0)
+        
+        return image
+    except Exception as e:
+        logger.error(f"OpenCV preprocessing error: {e}")
+        raise
+
 class FruitQualityPredictor:
     def __init__(self):
         if not TENSORFLOW_AVAILABLE:
             raise ImportError("TensorFlow is not available")
             
-        self.IMG_SIZE = (224, 224)  # Standard size for most models
+        self.IMG_SIZE = (224, 224)
         
         # Class names based on dataset structure
         self.fruit_classes = [
@@ -185,20 +241,6 @@ class FruitQualityPredictor:
             logger.error(f"❌ Error loading models: {e}")
             raise
     
-    def preprocess_image(self, image):
-        """Preprocess image for prediction"""
-        try:
-            # Resize image
-            image = cv2.resize(image, self.IMG_SIZE)
-            # Normalize pixel values
-            image = image / 255.0
-            # Add batch dimension
-            image = np.expand_dims(image, axis=0)
-            return image
-        except Exception as e:
-            logger.error(f"Error preprocessing image: {e}")
-            raise
-    
     def parse_prediction(self, predicted_class):
         """Parse prediction into fruit and quality"""
         try:
@@ -226,12 +268,14 @@ class FruitQualityPredictor:
     def predict_quality(self, image_path):
         """Predict fruit quality from image"""
         try:
-            # Read image
-            image = cv2.imread(image_path)
-            if image is None:
-                return {"error": "Could not load image"}
-            
-            processed_image = self.preprocess_image(image)
+            # Preprocess image based on available libraries
+            if OPENCV_AVAILABLE:
+                processed_image = preprocess_image_cv2(image_path)
+            elif PILLOW_AVAILABLE:
+                image = Image.open(image_path)
+                processed_image = preprocess_image_pil(image)
+            else:
+                return {"error": "No image processing library available"}
             
             # Get predictions from all models
             all_predictions = []
@@ -297,7 +341,8 @@ class FruitQualityPredictor:
                     'models_used': list(self.models.keys()),
                     'models_agree': agreement_count == len(self.models),
                     'agreement_count': agreement_count,
-                    'total_models': len(self.models)
+                    'total_models': len(self.models),
+                    'image_processor': 'opencv' if OPENCV_AVAILABLE else 'pil'
                 },
                 'individual_results': model_results
             }
@@ -338,9 +383,7 @@ def initialize_predictor():
 
 # Initialize on startup
 logger.info("🔧 Starting application initialization...")
-if not os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
-    # Initialize in production mode
-    initialize_predictor()
+initialize_predictor()
 
 def allowed_file(filename):
     return '.' in filename and \
@@ -352,6 +395,8 @@ def home():
         'message': 'Fruit Quality Prediction API',
         'status': 'running' if predictor else 'error',
         'tensorflow_available': TENSORFLOW_AVAILABLE,
+        'opencv_available': OPENCV_AVAILABLE,
+        'pillow_available': PILLOW_AVAILABLE,
         'predictor_initialized': predictor is not None,
         'models_loaded': len(predictor.models) if predictor else 0,
         'version': '1.0.0',
@@ -368,11 +413,12 @@ def health_check():
     return jsonify({
         'status': 'healthy' if predictor else 'error',
         'tensorflow_available': TENSORFLOW_AVAILABLE,
+        'opencv_available': OPENCV_AVAILABLE,
+        'pillow_available': PILLOW_AVAILABLE,
         'predictor_initialized': predictor is not None,
         'models_loaded': len(predictor.models) if predictor else 0,
         'models': list(predictor.models.keys()) if predictor else [],
-        'timestamp': time.time(),
-        'memory_usage_mb': os.sys.getsizeof([]) / (1024 * 1024)  # Simple memory check
+        'timestamp': time.time()
     })
 
 @app.route('/reload', methods=['POST'])
@@ -468,14 +514,11 @@ def predict_base64():
             image_data = image_data.split('base64,')[1]
         
         image_bytes = base64.b64decode(image_data)
-        image = Image.open(io.BytesIO(image_bytes))
-        
-        # Convert to OpenCV format
-        image_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
         
         # Save temporarily
         temp_path = os.path.join(app.config['UPLOAD_FOLDER'], 'temp_image.jpg')
-        cv2.imwrite(temp_path, image_cv)
+        with open(temp_path, 'wb') as f:
+            f.write(image_bytes)
         
         # Make prediction
         result = predictor.predict_quality(temp_path)
@@ -500,6 +543,8 @@ if __name__ == '__main__':
     print("🚀 Starting Fruit Quality Prediction API")
     print("=" * 60)
     print(f"✅ TensorFlow Available: {TENSORFLOW_AVAILABLE}")
+    print(f"✅ OpenCV Available: {OPENCV_AVAILABLE}")
+    print(f"✅ PIL Available: {PILLOW_AVAILABLE}")
     print(f"✅ Predictor Initialized: {predictor is not None}")
     
     if predictor:
