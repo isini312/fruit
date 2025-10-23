@@ -44,6 +44,7 @@ MODEL_FILES = [
 try:
     import tensorflow as tf
     from tensorflow.keras.models import load_model
+    from tensorflow.keras.layers import InputLayer
     TENSORFLOW_AVAILABLE = True
     logger.info("✅ TensorFlow imported successfully")
 except ImportError as e:
@@ -99,9 +100,28 @@ def download_model(url, filename):
         logger.error(f"❌ Download failed: {filename} - {e}")
         return False
 
+# Custom InputLayer to handle compatibility issues
+class CompatibleInputLayer(InputLayer):
+    def __init__(self, input_shape=None, batch_size=None, dtype=None, input_tensor=None, sparse=None, name=None, **kwargs):
+        # Handle batch_shape compatibility
+        if 'batch_shape' in kwargs:
+            batch_shape = kwargs.pop('batch_shape')
+            if batch_shape[0] is None:  # If batch size is None, use input_shape
+                input_shape = batch_shape[1:]
+        
+        super().__init__(
+            input_shape=input_shape,
+            batch_size=batch_size,
+            dtype=dtype,
+            input_tensor=input_tensor,
+            sparse=sparse,
+            name=name,
+            **kwargs
+        )
+
 class SimpleFruitPredictor:
     def __init__(self):
-        self.IMG_SIZE = (224, 224)
+        self.IMG_SIZE = (100, 100)  # Original model expects 100x100
         
         # Class names
         self.fruit_classes = [
@@ -126,49 +146,99 @@ class SimpleFruitPredictor:
         self.load_model()
     
     def load_model(self):
-        """Load the first available model"""
+        """Load the first available model with compatibility fixes"""
+        custom_objects = {
+            'InputLayer': CompatibleInputLayer
+        }
+        
         for model_info in MODEL_FILES:
             filename = model_info['filename']
             if os.path.exists(filename) and os.path.getsize(filename) > 1024 * 1024:
                 try:
                     logger.info(f"🔄 Loading model: {filename}")
-                    self.model = load_model(filename)
-                    logger.info(f"✅ Model loaded: {filename}")
+                    
+                    # Try loading with custom objects first
+                    try:
+                        self.model = load_model(filename, custom_objects=custom_objects, compile=False)
+                    except Exception as e:
+                        logger.warning(f"First load attempt failed: {e}")
+                        # Try without custom objects
+                        self.model = load_model(filename, compile=False)
+                    
+                    # Compile the model
+                    self.model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+                    
+                    logger.info(f"✅ Model loaded successfully: {filename}")
+                    logger.info(f"✅ Model input shape: {self.model.input_shape}")
+                    logger.info(f"✅ Model output shape: {self.model.output_shape}")
+                    
+                    # Test the model with a dummy prediction
+                    test_input = np.random.random((1, 100, 100, 3)).astype(np.float32)
+                    test_output = self.model.predict(test_input, verbose=0)
+                    logger.info(f"✅ Model test successful. Output shape: {test_output.shape}")
+                    
                     return
+                    
                 except Exception as e:
                     logger.error(f"❌ Failed to load {filename}: {e}")
         
-        raise Exception("No valid model found")
-    
+        raise Exception("No valid model could be loaded")
+
     def preprocess_image(self, image_path):
-        """Preprocess image"""
-        if OPENCV_AVAILABLE:
-            image = cv2.imread(image_path)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        else:
-            image = np.array(Image.open(image_path).convert('RGB'))
-        
-        image = cv2.resize(image, self.IMG_SIZE) if OPENCV_AVAILABLE else np.array(Image.fromarray(image).resize(self.IMG_SIZE))
-        image = image / 255.0
-        return np.expand_dims(image, axis=0)
+        """Preprocess image to match model expectations"""
+        try:
+            # Read image
+            if OPENCV_AVAILABLE:
+                image = cv2.imread(image_path)
+                if image is None:
+                    raise ValueError("Could not load image with OpenCV")
+                # Convert BGR to RGB
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            else:
+                image = np.array(Image.open(image_path).convert('RGB'))
+            
+            # Resize to model's expected input size (100x100)
+            if OPENCV_AVAILABLE:
+                image = cv2.resize(image, self.IMG_SIZE)
+            else:
+                image = np.array(Image.fromarray(image).resize(self.IMG_SIZE))
+            
+            # Normalize pixel values
+            image = image / 255.0
+            
+            # Ensure correct data type and shape
+            image = image.astype(np.float32)
+            image = np.expand_dims(image, axis=0)
+            
+            return image
+            
+        except Exception as e:
+            logger.error(f"Image preprocessing error: {e}")
+            raise
     
     def parse_prediction(self, predicted_class):
         """Parse prediction result"""
-        if 'Bad Quality_Fruits' in predicted_class:
-            quality = "Bad Quality"
-            fruit = predicted_class.replace('Bad Quality_Fruits_', '').replace('_Bad', '')
-        elif 'Good Quality_Fruits' in predicted_class:
-            quality = "Good Quality"
-            fruit = predicted_class.replace('Good Quality_Fruits_', '').replace('_Good', '')
-        elif 'Mixed Qualit_Fruits' in predicted_class:
-            quality = "Mixed Quality"
-            fruit = predicted_class.replace('Mixed Qualit_Fruits_', '')
-        else:
-            quality = "Unknown"
-            fruit = predicted_class
-        
-        fruit = self.fruit_name_mapping.get(fruit, fruit)
-        return quality, fruit
+        try:
+            if 'Bad Quality_Fruits' in predicted_class:
+                quality = "Bad Quality"
+                fruit_part = predicted_class.replace('Bad Quality_Fruits_', '')
+                fruit = self.fruit_name_mapping.get(fruit_part, fruit_part.replace('_Bad', ''))
+            elif 'Good Quality_Fruits' in predicted_class:
+                quality = "Good Quality"
+                fruit_part = predicted_class.replace('Good Quality_Fruits_', '')
+                fruit = self.fruit_name_mapping.get(fruit_part, fruit_part.replace('_Good', ''))
+            elif 'Mixed Qualit_Fruits' in predicted_class:
+                quality = "Mixed Quality"
+                fruit_part = predicted_class.replace('Mixed Qualit_Fruits_', '')
+                fruit = self.fruit_name_mapping.get(fruit_part, fruit_part)
+            else:
+                quality = "Unknown"
+                fruit = predicted_class
+            
+            return quality, fruit
+        except Exception as e:
+            logger.error(f"Error parsing prediction: {e}")
+            return "Unknown", predicted_class
     
     def predict(self, image_path):
         """Make prediction"""
@@ -255,7 +325,8 @@ def home():
         'endpoints': {
             '/': 'GET - API information',
             '/health': 'GET - Health check',
-            '/predict': 'POST - Upload image for prediction'
+            '/predict': 'POST - Upload image for prediction',
+            '/predict_base64': 'POST - Send base64 image'
         }
     })
 
@@ -372,7 +443,7 @@ if __name__ == '__main__':
     print("=" * 60)
     print("🚀 Fruit Quality Prediction API Starting...")
     print("=" * 60)
-    print("📝 The application will be ready once models are downloaded.")
+    print("📝 The application will be ready once models are downloaded and loaded.")
     print("🌐 Check /health endpoint for status")
     print(f"🔧 Port: {port}")
     print("=" * 60)
