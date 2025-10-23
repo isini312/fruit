@@ -27,8 +27,20 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 # Create upload folder
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Model URLs
+# Model URLs - Using direct GitHub raw URLs
 MODEL_FILES = [
+    {
+        'url': 'https://github.com/isini312/fruit/raw/main/best_model.keras',
+        'filename': 'best_model.keras'
+    },
+    {
+        'url': 'https://github.com/isini312/fruit/raw/main/fruitnet_final_model.keras',
+        'filename': 'fruitnet_final_model.keras'
+    }
+]
+
+# Alternative URLs if the above fail
+ALTERNATIVE_MODEL_URLS = [
     {
         'url': 'https://raw.githubusercontent.com/isini312/fruit/main/best_model.keras',
         'filename': 'best_model.keras'
@@ -65,52 +77,97 @@ except ImportError as e:
     PILLOW_AVAILABLE = False
     logger.error(f"❌ PIL import failed: {e}")
 
-def download_model(url, filename):
-    """Download model file from URL"""
-    try:
-        logger.info(f"📥 Downloading {filename} from {url}")
-        response = requests.get(url, stream=True, timeout=60)
-        response.raise_for_status()
-        
-        total_size = int(response.headers.get('content-length', 0))
-        downloaded_size = 0
-        
-        with open(filename, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    downloaded_size += len(chunk)
-                    if total_size > 0 and downloaded_size % (1024 * 1024) == 0:
-                        progress = (downloaded_size / total_size) * 100
-                        logger.info(f"📦 Downloading {filename}: {progress:.1f}%")
-        
-        file_size = os.path.getsize(filename)
-        logger.info(f"✅ Downloaded {filename} ({file_size / (1024*1024):.2f} MB)")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to download {filename}: {e}")
-        return False
+def download_model_with_retry(url, filename, max_retries=3):
+    """Download model file from URL with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"📥 Downloading {filename} from {url} (attempt {attempt + 1}/{max_retries})")
+            response = requests.get(url, stream=True, timeout=30)
+            response.raise_for_status()
+            
+            # Check if we got actual content
+            content_length = response.headers.get('content-length')
+            if content_length and int(content_length) < 1000:  # Too small for a model
+                logger.warning(f"⚠️ File seems too small: {content_length} bytes")
+                continue
+            
+            total_size = int(content_length) if content_length else 0
+            downloaded_size = 0
+            
+            with open(filename, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+                        if total_size > 0 and downloaded_size % (1024 * 1024) == 0:
+                            progress = (downloaded_size / total_size) * 100
+                            logger.info(f"📦 Downloading {filename}: {progress:.1f}%")
+            
+            # Verify file was actually downloaded
+            if not os.path.exists(filename):
+                logger.error(f"❌ File {filename} was not created")
+                continue
+                
+            file_size = os.path.getsize(filename)
+            logger.info(f"✅ Downloaded {filename} ({file_size / (1024*1024):.2f} MB)")
+            
+            # Check if file has reasonable size (models should be > 1MB)
+            if file_size < 1024 * 1024:  # Less than 1MB
+                logger.warning(f"⚠️ File {filename} is suspiciously small: {file_size} bytes")
+                os.remove(filename)  # Remove corrupted file
+                continue
+                
+            return True
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Download attempt {attempt + 1} failed: {e}")
+            time.sleep(2)  # Wait before retry
+        except Exception as e:
+            logger.error(f"❌ Unexpected error during download: {e}")
+            time.sleep(2)
+    
+    return False
 
 def download_all_models():
-    """Download all required model files"""
+    """Download all required model files with fallback URLs"""
     logger.info("🔄 Checking for model files...")
     
     models_downloaded = 0
     for model_info in MODEL_FILES:
         filename = model_info['filename']
-        url = model_info['url']
+        primary_url = model_info['url']
         
+        # Check if file already exists and is valid
         if os.path.exists(filename):
             file_size = os.path.getsize(filename)
-            logger.info(f"✅ {filename} already exists ({file_size / (1024*1024):.2f} MB)")
+            logger.info(f"📁 {filename} exists ({file_size / (1024*1024):.2f} MB)")
+            
+            # Check if file is valid (not empty/corrupted)
+            if file_size > 1024 * 1024:  # More than 1MB
+                logger.info(f"✅ {filename} appears valid")
+                models_downloaded += 1
+                continue
+            else:
+                logger.warning(f"⚠️ {filename} is too small, re-downloading...")
+                os.remove(filename)
+        
+        # Try primary URL first
+        logger.info(f"🔄 Downloading {filename} from primary URL...")
+        if download_model_with_retry(primary_url, filename):
             models_downloaded += 1
         else:
-            logger.info(f"🔄 Downloading {filename}...")
-            if download_model(url, filename):
+            # Try alternative URL
+            logger.warning(f"⚠️ Primary URL failed, trying alternative URL for {filename}...")
+            alt_url = None
+            for alt_model in ALTERNATIVE_MODEL_URLS:
+                if alt_model['filename'] == filename:
+                    alt_url = alt_model['url']
+                    break
+            
+            if alt_url and download_model_with_retry(alt_url, filename):
                 models_downloaded += 1
             else:
-                logger.error(f"❌ Failed to download {filename}")
+                logger.error(f"❌ All download attempts failed for {filename}")
     
     return models_downloaded == len(MODEL_FILES)
 
@@ -208,7 +265,7 @@ class FruitQualityPredictor:
         self.load_models()
     
     def load_models(self):
-        """Load all available models"""
+        """Load all available models with validation"""
         try:
             model_files = {}
             
@@ -216,23 +273,38 @@ class FruitQualityPredictor:
             for model_info in MODEL_FILES:
                 filename = model_info['filename']
                 if os.path.exists(filename):
-                    model_name = filename.replace('.keras', '')
-                    model_files[model_name] = filename
-                    logger.info(f"✅ Found model: {filename}")
+                    file_size = os.path.getsize(filename)
+                    if file_size > 1024 * 1024:  # Only consider files > 1MB as valid
+                        model_name = filename.replace('.keras', '')
+                        model_files[model_name] = filename
+                        logger.info(f"✅ Found valid model: {filename} ({file_size / (1024*1024):.2f} MB)")
+                    else:
+                        logger.warning(f"⚠️ Model file too small, likely corrupted: {filename} ({file_size} bytes)")
                 else:
                     logger.warning(f"⚠️ Model file not found: {filename}")
             
             if not model_files:
-                raise Exception("No model files found. Please download models first.")
+                raise Exception("No valid model files found. Please download models first.")
             
             logger.info("🔄 Loading models...")
             for model_name, model_path in model_files.items():
                 logger.info(f"   Loading {model_name} from {model_path}")
                 try:
+                    # Test load the model
                     self.models[model_name] = load_model(model_path)
                     logger.info(f"   ✅ {model_name} loaded successfully")
+                    
+                    # Test prediction with dummy data to verify model works
+                    test_input = np.random.random((1, 224, 224, 3)).astype(np.float32)
+                    test_prediction = self.models[model_name].predict(test_input, verbose=0)
+                    logger.info(f"   ✅ {model_name} test prediction successful (shape: {test_prediction.shape})")
+                    
                 except Exception as e:
                     logger.error(f"   ❌ Failed to load {model_name}: {e}")
+                    # Remove corrupted file
+                    if os.path.exists(model_path):
+                        os.remove(model_path)
+                        logger.info(f"   🗑️ Removed corrupted file: {model_path}")
                     raise
             
             logger.info(f"🎯 All models loaded successfully! {len(self.models)} models ready.")
@@ -240,7 +312,7 @@ class FruitQualityPredictor:
         except Exception as e:
             logger.error(f"❌ Error loading models: {e}")
             raise
-    
+
     def parse_prediction(self, predicted_class):
         """Parse prediction into fruit and quality"""
         try:
@@ -401,10 +473,12 @@ def home():
         'models_loaded': len(predictor.models) if predictor else 0,
         'version': '1.0.0',
         'endpoints': {
-            '/predict': 'POST - Upload image for prediction',
+            '/': 'GET - API information',
+            '/health': 'GET - Health check',
+            '/predict': 'POST - Upload image file',
             '/predict_base64': 'POST - Send base64 image',
-            '/health': 'GET - API health check',
-            '/reload': 'POST - Reload models'
+            '/reload': 'POST - Reload models',
+            '/debug': 'GET - Debug information'
         }
     })
 
@@ -419,6 +493,25 @@ def health_check():
         'models_loaded': len(predictor.models) if predictor else 0,
         'models': list(predictor.models.keys()) if predictor else [],
         'timestamp': time.time()
+    })
+
+@app.route('/debug', methods=['GET'])
+def debug_info():
+    """Debug endpoint to check file status"""
+    file_info = {}
+    for model_info in MODEL_FILES:
+        filename = model_info['filename']
+        exists = os.path.exists(filename)
+        file_info[filename] = {
+            'exists': exists,
+            'size_bytes': os.path.getsize(filename) if exists else 0,
+            'size_mb': round(os.path.getsize(filename) / (1024*1024), 2) if exists else 0
+        }
+    
+    return jsonify({
+        'files': file_info,
+        'current_directory': os.listdir('.'),
+        'working_directory': os.getcwd()
     })
 
 @app.route('/reload', methods=['POST'])
@@ -557,6 +650,7 @@ if __name__ == '__main__':
     print("\n📝 API Endpoints:")
     print("   GET  /               - API information")
     print("   GET  /health         - Health check")
+    print("   GET  /debug          - Debug information")
     print("   POST /predict        - Upload image file")
     print("   POST /predict_base64 - Send base64 image")
     print("   POST /reload         - Reload models")
